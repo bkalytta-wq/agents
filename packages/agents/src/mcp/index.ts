@@ -21,7 +21,8 @@ import {
   handleCORS,
   isDurableObjectNamespace,
   MCP_HTTP_METHOD_HEADER,
-  MCP_MESSAGE_HEADER
+  MCP_MESSAGE_HEADER,
+  MCP_MESSAGE_MODE_HEADER
 } from "./utils";
 import { McpSSETransport, StreamableHTTPServerTransport } from "./transport";
 import { RPCServerTransport, type RPCServerTransportOptions } from "./rpc";
@@ -35,6 +36,24 @@ export abstract class McpAgent<
   private _pendingElicitations = new Map<
     string,
     { resolve: (result: ElicitResult) => void; reject: (err: Error) => void }
+  >();
+  /**
+   * In-memory store for JSON-RPC payloads stashed by the front-door
+   * Worker before a WebSocket upgrade, keyed by a short opaque id.
+   *
+   * Used only when the payload is too large to fit in the
+   * `cf-mcp-message` HTTP header (Cloudflare's edge caps combined
+   * request headers at ~32 KB; base64 of a payload >~16 KB blows
+   * past that and surfaces as `TLS Alert: record_overflow`).
+   *
+   * Entries are short-lived: the front-door Worker stashes a
+   * payload, then immediately performs the WS upgrade that
+   * consumes (and deletes) the entry. A 30 s reaper guards against
+   * orphans on rare upgrade failures.
+   */
+  private _stashedPayloads = new Map<
+    string,
+    { payload: string; expiresAt: number }
   >();
   props?: Props;
 
@@ -185,6 +204,40 @@ export abstract class McpAgent<
     await this.reinitializeServer();
   }
 
+  /**
+   * Intercepts the front-door Worker's payload-stash POST before
+   * delegating everything else (including WebSocket upgrades) to
+   * the partyserver base class. See `_stashedPayloads` for why.
+   */
+  override async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (
+      request.method === "POST" &&
+      url.pathname.endsWith("/__mcp_stash_payload")
+    ) {
+      const payload = await request.text();
+      if (payload.length > 4 * 1024 * 1024) {
+        return new Response("Payload too large", { status: 413 });
+      }
+      // Reap any expired entries opportunistically. The map is
+      // expected to be near-empty in steady state.
+      const now = Date.now();
+      for (const [k, v] of this._stashedPayloads) {
+        if (v.expiresAt < now) this._stashedPayloads.delete(k);
+      }
+      const id = crypto.randomUUID();
+      this._stashedPayloads.set(id, {
+        payload,
+        expiresAt: now + 30_000
+      });
+      return new Response(JSON.stringify({ id }), {
+        headers: { "content-type": "application/json" },
+        status: 200
+      });
+    }
+    return super.fetch(request);
+  }
+
   /** Validates new WebSocket connections. */
   async onConnect(
     conn: Connection,
@@ -205,21 +258,42 @@ export abstract class McpAgent<
         if (this._transport instanceof StreamableHTTPServerTransport) {
           switch (req.headers.get(MCP_HTTP_METHOD_HEADER)) {
             case "POST": {
-              // This returns the response directly to the client
-              const payloadHeader = req.headers.get(MCP_MESSAGE_HEADER);
+              // The JSON-RPC payload is delivered either:
+              //   (a) inline in the `cf-mcp-message` header (legacy
+              //       fast path, base64-encoded), or
+              //   (b) pre-stashed via a separate POST to
+              //       /__mcp_stash_payload, with the
+              //       `cf-mcp-message-mode: body:<id>` header
+              //       carrying the lookup id (used for payloads
+              //       that would otherwise overflow CF edge's
+              //       ~32 KB header limit).
+              const modeHeader = req.headers.get(MCP_MESSAGE_MODE_HEADER);
               let rawPayload: string;
 
-              if (!payloadHeader) {
-                rawPayload = "{}";
-              } else {
-                try {
-                  rawPayload = Buffer.from(payloadHeader, "base64").toString(
-                    "utf-8"
-                  );
-                } catch (_error) {
+              if (modeHeader && modeHeader.startsWith("body:")) {
+                const stashId = modeHeader.slice("body:".length);
+                const stashed = this._stashedPayloads.get(stashId);
+                this._stashedPayloads.delete(stashId);
+                if (!stashed) {
                   throw new Error(
-                    "Internal Server Error: Failed to decode MCP message header"
+                    "Internal Server Error: stashed MCP payload not found or expired"
                   );
+                }
+                rawPayload = stashed.payload;
+              } else {
+                const payloadHeader = req.headers.get(MCP_MESSAGE_HEADER);
+                if (!payloadHeader) {
+                  rawPayload = "{}";
+                } else {
+                  try {
+                    rawPayload = Buffer.from(payloadHeader, "base64").toString(
+                      "utf-8"
+                    );
+                  } catch (_error) {
+                    throw new Error(
+                      "Internal Server Error: Failed to decode MCP message header"
+                    );
+                  }
                 }
               }
 

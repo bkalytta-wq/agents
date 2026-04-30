@@ -18,7 +18,11 @@ import type {
 import { getCurrentAgent, type Connection } from "..";
 import type { McpAgent } from ".";
 import { MessageType } from "../types";
-import { MCP_HTTP_METHOD_HEADER, MCP_MESSAGE_HEADER } from "./utils";
+import {
+  MCP_HTTP_METHOD_HEADER,
+  MCP_MESSAGE_HEADER,
+  MCP_MESSAGE_MODE_HEADER
+} from "./utils";
 
 export type { EventStore, StreamId, EventId };
 
@@ -227,6 +231,7 @@ export class StreamableHTTPServerTransport implements Transport {
     // Remove headers that are not part of the original request
     delete requestInfo.headers[MCP_HTTP_METHOD_HEADER];
     delete requestInfo.headers[MCP_MESSAGE_HEADER];
+    delete requestInfo.headers[MCP_MESSAGE_MODE_HEADER];
     delete requestInfo.headers.upgrade;
 
     const rawMessage = parsedBody;

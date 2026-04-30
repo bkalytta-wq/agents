@@ -261,6 +261,52 @@ describe("Streamable HTTP Transport", () => {
           result.content?.[0]?.text === `Hello, ${unicodeName}!`
       ).toBe(true);
     });
+
+    it("should accept JSON payloads larger than the 32 KB header limit (body-forwarding path)", async () => {
+      // Regression test: cf-mcp-message used to base64-encode the
+      // entire JSON-RPC payload into a single HTTP header. CF
+      // edge caps combined headers at ~32 KB; any tool call whose
+      // raw payload exceeds ~16 KB tripped the limit and produced
+      // a TLS Alert: record_overflow. The body-forwarding path
+      // (cf-mcp-message-mode: body:<id>) sidesteps the limit by
+      // pre-stashing the payload via a separate POST.
+      const ctx = createExecutionContext();
+      const sessionId = await initializeStreamableHTTPServer(ctx);
+
+      // 24 KB raw → ~32 KB base64 → would have failed pre-fix.
+      const largeName = "x".repeat(24 * 1024);
+      const largeRequest: JSONRPCMessage[] = [
+        {
+          id: "large-1",
+          jsonrpc: "2.0",
+          method: "tools/call",
+          params: {
+            name: "greet",
+            arguments: { name: largeName }
+          }
+        }
+      ];
+
+      const response = await sendPostRequest(
+        ctx,
+        baseUrl,
+        largeRequest,
+        sessionId
+      );
+
+      expect(response.status).toBe(200);
+
+      const sseText = await readSSEEvent(response);
+      const parsed = parseSSEData(sseText) as JSONRPCResultResponse;
+      expect(parsed.id).toBe("large-1");
+
+      const result = parsed.result as CallToolResult;
+      expect(result.content).toBeDefined();
+      expect(
+        result.content?.[0]?.type === "text" &&
+          result.content?.[0]?.text === `Hello, ${largeName}!`
+      ).toBe(true);
+    });
   });
 
   describe("Batch Operations", () => {

@@ -23,8 +23,35 @@ export const MCP_HTTP_METHOD_HEADER = "cf-mcp-method";
  * Since we use WebSockets to bridge the client to the
  * MCP transport in the Agent, we use this header to include
  * the original request body.
+ *
+ * NOTE: Cloudflare's edge limits the combined HTTP request header
+ * size to ~32 KB. Base64-encoding inflates payloads by ~33%, so
+ * any JSON-RPC payload larger than ~16 KB risks tripping the limit
+ * and producing an opaque `TLS Alert: record_overflow` failure
+ * before the Worker handler runs. For payloads above
+ * `MCP_MESSAGE_HEADER_THRESHOLD_BYTES`, the front-door Worker
+ * forwards the message via the request body and signals this with
+ * `cf-mcp-message-mode: body`. The DO-side `onConnect` handler
+ * reads the body in that case.
  */
 export const MCP_MESSAGE_HEADER = "cf-mcp-message";
+
+/**
+ * When set to `body`, indicates the JSON-RPC payload was forwarded
+ * via the request body (UTF-8 JSON) instead of the
+ * `cf-mcp-message` header. Used for payloads above
+ * `MCP_MESSAGE_HEADER_THRESHOLD_BYTES`.
+ */
+export const MCP_MESSAGE_MODE_HEADER = "cf-mcp-message-mode";
+
+/**
+ * Threshold (in bytes of the *raw* JSON payload) above which the
+ * front-door Worker switches from header-forwarding to body-
+ * forwarding. Chosen conservatively: 4 KB raw → ~5.4 KB base64,
+ * leaving comfortable headroom for auth headers, CF headers, etc.
+ * within the ~32 KB total header budget.
+ */
+export const MCP_MESSAGE_HEADER_THRESHOLD_BYTES = 4 * 1024;
 
 const MAXIMUM_MESSAGE_SIZE_BYTES = 4 * 1024 * 1024; // 4MB
 
@@ -232,15 +259,63 @@ export const createStreamingHttpHandler = (
           existingHeaders[key] = value;
         });
 
-        const req = new Request(request.url, {
-          headers: {
-            ...existingHeaders,
-            [MCP_HTTP_METHOD_HEADER]: "POST",
-            [MCP_MESSAGE_HEADER]: Buffer.from(
-              JSON.stringify(messages)
-            ).toString("base64"),
-            Upgrade: "websocket"
+        // Decide between header- and body-forwarding for the
+        // JSON-RPC payload. The header path is the legacy fast
+        // path and works for the vast majority of tool calls; the
+        // body path (a separate HTTP POST to stash the payload in
+        // the DO before the WS upgrade) is used for large
+        // payloads to avoid Cloudflare edge's ~32 KB combined
+        // header limit (which surfaces as an opaque TLS
+        // record_overflow alert before the Worker handler runs).
+        // See `MCP_MESSAGE_HEADER` doc above.
+        const serializedMessages = JSON.stringify(messages);
+        const useBodyMode =
+          serializedMessages.length > MCP_MESSAGE_HEADER_THRESHOLD_BYTES;
+
+        const forwardHeaders: Record<string, string> = {
+          ...existingHeaders,
+          [MCP_HTTP_METHOD_HEADER]: "POST",
+          Upgrade: "websocket"
+        };
+
+        if (useBodyMode) {
+          // 1. Pre-stash the payload via a plain HTTP POST to the
+          //    DO. The DO returns a short opaque payload-id we
+          //    pass on the WS upgrade. This keeps the upgrade
+          //    headers tiny while still delivering the full
+          //    JSON-RPC message.
+          const stashUrl = new URL(request.url);
+          stashUrl.pathname = `${stashUrl.pathname.replace(/\/$/, "")}/__mcp_stash_payload`;
+          const stashResp = await agent.fetch(
+            new Request(stashUrl.toString(), {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: serializedMessages
+            })
+          );
+          if (!stashResp.ok) {
+            const body = JSON.stringify({
+              error: {
+                code: -32001,
+                message: `Failed to stash MCP payload (status ${stashResp.status})`
+              },
+              id: null,
+              jsonrpc: "2.0"
+            });
+            return new Response(body, { status: 500 });
           }
+          const { id: payloadId } = (await stashResp.json()) as {
+            id: string;
+          };
+          forwardHeaders[MCP_MESSAGE_MODE_HEADER] = `body:${payloadId}`;
+        } else {
+          forwardHeaders[MCP_MESSAGE_HEADER] = Buffer.from(
+            serializedMessages
+          ).toString("base64");
+        }
+
+        const req = new Request(request.url, {
+          headers: forwardHeaders
         });
         const response = await agent.fetch(req);
 
