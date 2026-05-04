@@ -281,15 +281,73 @@ describe("DynamicWorkerExecutor", () => {
     const listIssues = vi.fn(async () => [{ id: 1, title: "bug" }]);
     const executor = new DynamicWorkerExecutor({ loader: env.LOADER });
 
-    // Note: sanitization happens in createCodeTool (tool.ts), not the executor.
-    // The executor receives pre-sanitized names.
+    // The executor sanitizes raw provider keys internally (executor.ts:316-330):
+    // a provider registered as "github.list-issues" is reachable in the
+    // sandbox as the type-generated identifier `codemode.github_list_issues`.
     const result = await executor.execute(
       "async () => await codemode.github_list_issues({})",
-      [codemodeProvider({ github_list_issues: listIssues })]
+      [codemodeProvider({ "github.list-issues": listIssues })]
     );
 
     expect(result.result).toEqual([{ id: 1, title: "bug" }]);
     expect(listIssues).toHaveBeenCalledWith({});
+  });
+
+  it("should accept raw hyphenated tool names in dispatch (#806)", async () => {
+    // Regression for https://github.com/cloudflare/agents/issues/806 — even
+    // after #1117 introduced internal sanitization on the registration side,
+    // the runtime proxy still passed the looked-up tool name through to the
+    // dispatcher unchanged. Callers that obtained the tool name via discovery
+    // (the raw, hyphen-bearing form) and dispatched with bracket notation —
+    // e.g. `codemode["github-list-issues"]({})` — got "Tool not found"
+    // because the dispatcher only knew the sanitized key.
+    const listIssues = vi.fn(async () => [{ id: 1, title: "bug" }]);
+    const executor = new DynamicWorkerExecutor({ loader: env.LOADER });
+
+    const result = await executor.execute(
+      `async () => await codemode["github-list-issues"]({})`,
+      [codemodeProvider({ "github-list-issues": listIssues })]
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.result).toEqual([{ id: 1, title: "bug" }]);
+    expect(listIssues).toHaveBeenCalledWith({});
+  });
+
+  it("should accept both raw and sanitized names against the same provider", async () => {
+    // Both call shapes must reach the same underlying tool function: the
+    // sanitized form (used by AI-generated code) and the raw form (used by
+    // clients that discovered the tool name via MCP discovery).
+    const listIssues = vi.fn(async () => [{ id: 42 }]);
+    const executor = new DynamicWorkerExecutor({ loader: env.LOADER });
+
+    const result = await executor.execute(
+      `async () => {
+        const a = await codemode.github_list_issues({});
+        const b = await codemode["github-list-issues"]({});
+        return { a, b };
+      }`,
+      [codemodeProvider({ "github-list-issues": listIssues })]
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.result).toEqual({ a: [{ id: 42 }], b: [{ id: 42 }] });
+    expect(listIssues).toHaveBeenCalledTimes(2);
+  });
+
+  it("should accept names with dots in dispatch", async () => {
+    // Same asymmetry, dot-separator variant (e.g. "github.list-issues"
+    // becomes "github_list_issues" under sanitizeToolName).
+    const listIssues = vi.fn(async () => "ok");
+    const executor = new DynamicWorkerExecutor({ loader: env.LOADER });
+
+    const result = await executor.execute(
+      `async () => await codemode["github.list-issues"]({})`,
+      [codemodeProvider({ "github.list-issues": listIssues })]
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.result).toBe("ok");
   });
 
   it("should include timeout in execution", async () => {

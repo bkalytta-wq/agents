@@ -319,7 +319,19 @@ export class DynamicWorkerExecutor implements Executor {
         (...args: unknown[]) => Promise<unknown>
       > = {};
       for (const [name, fn] of Object.entries(provider.fns)) {
-        sanitizedFns[sanitizeToolName(name)] = fn;
+        const sanitized = sanitizeToolName(name);
+        sanitizedFns[sanitized] = fn;
+        // Also register under the raw name so dispatch works regardless of
+        // whether the caller uses the discovery form (raw, e.g.
+        // "github.list-issues") or the type-generated identifier form
+        // (sanitized, e.g. "github_list_issues"). Without this, callers
+        // that look up tool names via discovery — e.g. MCP clients
+        // emitting `codemode["github-list-issues"]({})` — fail with
+        // "Tool not found", even though the same provider works fine
+        // when the LLM uses the sanitized identifier. See #806.
+        if (sanitized !== name) {
+          sanitizedFns[name] = fn;
+        }
       }
       dispatchers[provider.name] = new ToolDispatcher(
         sanitizedFns,
